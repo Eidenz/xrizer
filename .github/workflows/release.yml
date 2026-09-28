@@ -14,7 +14,8 @@ jobs:
   vendor-dependencies:
     runs-on: ubuntu-latest
     container:
-      image: 'ghcr.io/supreeeme/xrizer-ubuntu:latest'
+      # The fork's own build container (made by ci.yml): upstream's is private.
+      image: 'ghcr.io/eidenz/xrizer-ubuntu:latest'
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
