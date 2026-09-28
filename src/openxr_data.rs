@@ -237,6 +237,10 @@ impl<C: Compositor> OpenXrData<C> {
             .expect("Session is being restarted, but compositor has not been set up!");
 
         let info = comp.get_session_create_info(std::mem::take(&mut session_guard.comp_data));
+        let devices = self
+            .input
+            .get()
+            .map(|input| input.device_layout(&session_guard));
 
         // We need to destroy the old session before creating the new one.
         let _ = unsafe { ManuallyDrop::take(&mut *session_guard) };
@@ -247,8 +251,8 @@ impl<C: Compositor> OpenXrData<C> {
 
         comp.post_session_restart(&session, waiter, stream);
 
-        if let Some(input) = self.input.get() {
-            input.post_session_restart(&session);
+        if let (Some(input), Some(devices)) = (self.input.get(), devices) {
+            input.post_session_restart(&session, devices);
         }
 
         *session_guard = ManuallyDrop::new(session);

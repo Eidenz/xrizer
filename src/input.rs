@@ -1,4 +1,5 @@
 mod action_manifest;
+mod bindings_watch;
 mod custom_bindings;
 mod devices;
 mod legacy;
@@ -62,6 +63,11 @@ pub struct Input<C: openxr_data::Compositor> {
     subaction_paths: SubactionPaths,
     events: Mutex<VecDeque<InputEvent>>,
     loading_actions: AtomicBool,
+    /// Personal bindings changing on disk (set up with the first action manifest).
+    bindings_watch: OnceLock<Option<bindings_watch::BindingsWatch>>,
+    /// Where tests keep personal bindings, instead of `xrizer/` in the working directory.
+    #[cfg(test)]
+    test_bindings_dir: OnceLock<PathBuf>,
 }
 
 struct InputEvent {
@@ -135,6 +141,9 @@ impl<C: openxr_data::Compositor> Input<C> {
             subaction_paths,
             events: Mutex::default(),
             loading_actions: false.into(),
+            bindings_watch: OnceLock::new(),
+            #[cfg(test)]
+            test_bindings_dir: OnceLock::new(),
         }
     }
 
@@ -1408,19 +1417,7 @@ impl<C: openxr_data::Compositor> Input<C> {
                 if let Some(controller) = controller.as_mut() {
                     controller.profile_data = Some(data);
                 } else {
-                    let hand_tracker = session_data
-                        .session
-                        .create_hand_tracker(hand.into())
-                        .inspect_err(|e| {
-                            if !matches!(
-                                *e,
-                                xr::sys::Result::ERROR_EXTENSION_NOT_PRESENT
-                                    | xr::sys::Result::ERROR_FEATURE_UNSUPPORTED
-                            ) {
-                                log::warn!("Failed to create hand tracker for hand {hand:?}: {e}");
-                            }
-                        })
-                        .ok();
+                    let hand_tracker = devices::create_hand_tracker(&session_data.session, hand);
                     devices_to_create.push((
                         TrackedDeviceType::Controller {
                             hand,
@@ -1530,9 +1527,50 @@ impl<C: openxr_data::Compositor> Input<C> {
         }
     }
 
-    pub fn post_session_restart(&self, data: &SessionData) {
+    /// Personal bindings changed on disk: restart the session, which loads the
+    /// action manifest (and so the bindings) again, and tell the game, like
+    /// SteamVR does after its binding editor saves. Called between frames.
+    pub fn reload_changed_bindings(&self) {
+        let Some(Some(watch)) = self.bindings_watch.get() else {
+            return;
+        };
+        if !watch.pending() {
+            return;
+        }
+        {
+            // Not before the game renders into its real session with its actions
+            // loaded (getting there reloads the bindings anyway).
+            let data = self.openxr.session_data.get();
+            if !data.is_real_session() || data.input_data.get_loaded_actions().is_none() {
+                return;
+            }
+        }
+        watch.take();
+        info!("Personal bindings changed: restarting the session to load them");
+        self.openxr.restart_session();
+        self.events.lock().unwrap().push_back(InputEvent {
+            ty: vr::EVREventType::ActionBindingReloaded,
+            index: vr::k_unTrackedDeviceIndex_Hmd,
+            data: Default::default(),
+        });
+    }
+
+    /// What of the old session's devices to carry into the next one.
+    pub fn device_layout(&self, data: &SessionData) -> devices::DeviceLayout {
+        data.input_data.devices.read().unwrap().layout()
+    }
+
+    pub fn post_session_restart(&self, data: &SessionData, devices: devices::DeviceLayout) {
         // This function is called while a write lock is called on the session, and as such should
         // not use self.openxr.session_data.get().
+        {
+            // Same devices at the same indices, still connected: nothing for the game to notice.
+            let mut list = data.input_data.devices.write().unwrap();
+            *list = TrackedDeviceList::from_layout(devices, &data.session);
+            #[cfg(feature = "monado")]
+            list.create_monado_generic_trackers(&self.openxr, data)
+                .unwrap_or_else(|e| warn!("Couldn't recreate generic trackers: {e}"));
+        }
         data.input_data
             .pose_data
             .set(PoseData::new(
