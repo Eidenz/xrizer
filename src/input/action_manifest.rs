@@ -7,6 +7,7 @@ pub(super) use bindings::{ClickThresholdParams, GrabParameters};
 
 use crate::input::InteractionProfile;
 use crate::input::action_manifest::context::BindingsLoadContext;
+use crate::input::bindings_watch::BindingsWatch;
 use crate::input::profiles::LegalPathsT;
 use crate::input::{ActionKey, Input, profiles::RunWithProfile, skeletal::SkeletalInputActionData};
 use crate::openxr_data::{self, Hand, SessionData};
@@ -248,25 +249,51 @@ impl<C: openxr_data::Compositor> Input<C> {
     }
 }
 
+/// A controller's personal binding file name (`knuckles.json`, `oculustouch.json`…).
+fn custom_bindings_file(controller_type: &actions::ControllerType) -> String {
+    format!("{controller_type:?}.json").to_lowercase()
+}
+
 impl<C: openxr_data::Compositor> Input<C> {
+    /// Where personal bindings live: `$XRIZER_CUSTOM_BINDINGS_DIR`, else `xrizer/`
+    /// in the working directory.
+    fn custom_bindings_dir(&self) -> PathBuf {
+        #[cfg(test)]
+        if let Some(dir) = self.test_bindings_dir.get() {
+            return dir.clone();
+        }
+        match std::env::var("XRIZER_CUSTOM_BINDINGS_DIR") {
+            Ok(dir) => PathBuf::from(dir),
+            Err(_) => current_dir().unwrap_or_default().join("xrizer"),
+        }
+    }
+
     fn load_bindings(
         &self,
         parent_path: &Path,
         bindings: Vec<actions::DefaultBindings>,
         context: &mut context::BindingsLoadContext,
     ) {
+        let custom_dir = self.custom_bindings_dir();
+        // Pick up personal bindings saved while the game runs (see bindings_watch).
+        self.bindings_watch.get_or_init(|| {
+            let mut files: Vec<String> = bindings
+                .iter()
+                .filter(|b| !matches!(b.controller_type, actions::ControllerType::Unknown(_)))
+                .map(|b| custom_bindings_file(&b.controller_type))
+                .collect();
+            files.sort();
+            files.dedup();
+            BindingsWatch::start(custom_dir.clone(), files)
+        });
+
         let mut it = bindings.into_iter().peekable();
         while let Some(actions::DefaultBindings {
             binding_url,
             controller_type,
         }) = it.next()
         {
-            let custom_path = if let Ok(custom_dir) = std::env::var("XRIZER_CUSTOM_BINDINGS_DIR") {
-                PathBuf::from(custom_dir)
-            } else {
-                current_dir().unwrap().join("xrizer")
-            }
-            .join(format!("{controller_type:?}.json").to_lowercase());
+            let custom_path = custom_dir.join(custom_bindings_file(&controller_type));
             let bindings_path = match custom_path.exists() {
                 true => custom_path,
                 false => parent_path.join(binding_url),

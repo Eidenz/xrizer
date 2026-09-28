@@ -1,4 +1,5 @@
 mod action_manifest;
+mod bindings_watch;
 mod custom_bindings;
 mod devices;
 mod legacy;
@@ -62,6 +63,11 @@ pub struct Input<C: openxr_data::Compositor> {
     subaction_paths: SubactionPaths,
     events: Mutex<VecDeque<InputEvent>>,
     loading_actions: AtomicBool,
+    /// Personal bindings changing on disk (set up with the first action manifest).
+    bindings_watch: OnceLock<Option<bindings_watch::BindingsWatch>>,
+    /// Where tests keep personal bindings, instead of `xrizer/` in the working directory.
+    #[cfg(test)]
+    test_bindings_dir: OnceLock<PathBuf>,
 }
 
 struct InputEvent {
@@ -135,6 +141,9 @@ impl<C: openxr_data::Compositor> Input<C> {
             subaction_paths,
             events: Mutex::default(),
             loading_actions: false.into(),
+            bindings_watch: OnceLock::new(),
+            #[cfg(test)]
+            test_bindings_dir: OnceLock::new(),
         }
     }
 
@@ -1516,6 +1525,34 @@ impl<C: openxr_data::Compositor> Input<C> {
                 self.setup_legacy_actions();
             }
         }
+    }
+
+    /// Personal bindings changed on disk: restart the session, which loads the
+    /// action manifest (and so the bindings) again, and tell the game, like
+    /// SteamVR does after its binding editor saves. Called between frames.
+    pub fn reload_changed_bindings(&self) {
+        let Some(Some(watch)) = self.bindings_watch.get() else {
+            return;
+        };
+        if !watch.pending() {
+            return;
+        }
+        {
+            // Not before the game renders into its real session with its actions
+            // loaded (getting there reloads the bindings anyway).
+            let data = self.openxr.session_data.get();
+            if !data.is_real_session() || data.input_data.get_loaded_actions().is_none() {
+                return;
+            }
+        }
+        watch.take();
+        info!("Personal bindings changed: restarting the session to load them");
+        self.openxr.restart_session();
+        self.events.lock().unwrap().push_back(InputEvent {
+            ty: vr::EVREventType::ActionBindingReloaded,
+            index: vr::k_unTrackedDeviceIndex_Hmd,
+            data: Default::default(),
+        });
     }
 
     /// What of the old session's devices to carry into the next one.

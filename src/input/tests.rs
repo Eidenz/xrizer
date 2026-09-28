@@ -1135,3 +1135,75 @@ fn devices_survive_session_restart() {
     assert_eq!(f.controller_slot(Hand::Left), Some(before));
     assert!(f.next_event().is_none(), "no disconnect / reconnect");
 }
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn personal_bindings_reload_while_running() {
+    let mut f = Fixture::new();
+    let dir = std::env::temp_dir().join(format!("xrizer-live-bindings-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    f.input.test_bindings_dir.set(dir.clone()).unwrap();
+    let boolact = f.get_action_handle(c"/actions/set1/in/boolact");
+    let active = vr::VRActiveActionSet_t {
+        ulActionSet: f.get_action_set_handle(c"/actions/set1"),
+        ..Default::default()
+    };
+    f.load_actions(c"actions.json");
+    f.input.openxr.restart_session(); // into the real session
+    f.set_interaction_profile::<Knuckles>(LeftHand);
+    f.sync(active);
+    let profile = f
+        .input
+        .openxr
+        .instance
+        .string_to_path(Knuckles::profile_path())
+        .unwrap();
+    assert!(
+        fakexr::get_suggested_bindings(f.get_action::<bool>(boolact), profile)
+            .contains(&"/user/hand/left/input/a/click".to_string())
+    );
+    while f.next_event().is_some() {}
+    let before = f.controller_slot(Hand::Left).expect("the left controller");
+
+    // Saved while the game runs: the left trigger does it now.
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("knuckles.json"),
+        r#"{ "bindings": { "/actions/set1": { "sources": [ {
+            "path": "/user/hand/left/input/trigger", "mode": "button",
+            "inputs": { "click": { "output": "/actions/set1/in/boolact" } }
+        } ] } } }"#,
+    )
+    .unwrap();
+    let watch = f.input.bindings_watch.get().unwrap().as_ref().unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !watch.pending() {
+        assert!(std::time::Instant::now() < until, "the save went unnoticed");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    f.input.reload_changed_bindings();
+    f.set_interaction_profile::<Knuckles>(LeftHand);
+    f.sync(active);
+
+    // A trigger as a button reads its value against a threshold.
+    assert!(fakexr::check_no_suggested_bindings(
+        f.get_action::<bool>(boolact),
+        profile
+    ));
+    f.verify_extra_bindings(
+        Knuckles::profile_path(),
+        c"/actions/set1/in/boolact",
+        ExtraActionType::Analog,
+        ["/user/hand/left/input/trigger/value".into()],
+    );
+    // Same controller, never disconnected: the game only hears about the reload.
+    assert_eq!(f.controller_slot(Hand::Left), Some(before));
+    let event = f.next_event().expect("the reload event");
+    assert_eq!(
+        event.eventType,
+        vr::EVREventType::ActionBindingReloaded as u32
+    );
+    assert!(f.next_event().is_none(), "no other event");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

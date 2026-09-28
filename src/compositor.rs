@@ -878,18 +878,21 @@ impl vr::IVRCompositor029_Interface for Compositor {
         // This should be called every frame - we must regularly poll events
         self.openxr.poll_events();
         self.focused.call_once(|| {});
+        let timing_mode = *self.timing_mode.lock().unwrap();
+        if matches!(
+            timing_mode,
+            vr::EVRCompositorTimingMode::Implicit
+                | vr::EVRCompositorTimingMode::Explicit_RuntimePerformsPostPresentHandoff
+        ) && *self.frame_state.lock().unwrap() == FrameState::Begun
+        {
+            self.PostPresentHandoff();
+        }
+        // Between two frames: the moment to swap in bindings changed on disk.
+        if let Some(input) = self.input.get() {
+            input.reload_changed_bindings();
+        }
         {
             let session_data = self.openxr.session_data.get();
-            let timing_mode = *self.timing_mode.lock().unwrap();
-            if matches!(
-                timing_mode,
-                vr::EVRCompositorTimingMode::Implicit
-                    | vr::EVRCompositorTimingMode::Explicit_RuntimePerformsPostPresentHandoff
-            ) && *self.frame_state.lock().unwrap() == FrameState::Begun
-            {
-                self.PostPresentHandoff();
-            }
-
             if *self.frame_state.lock().unwrap() == FrameState::Waited {
                 // discard frame
                 self.maybe_begin_frame(&session_data);
