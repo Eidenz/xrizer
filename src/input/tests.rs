@@ -1085,3 +1085,53 @@ fn load_actions_race() {
     let res = f.get_bool_state(boolact);
     assert!(res.is_ok(), "{res:?}");
 }
+
+impl Fixture {
+    /// The next event the game would get, if any.
+    pub fn next_event(&self) -> Option<vr::VREvent_t> {
+        // SAFETY: a plain C struct, all zeroes is a valid value.
+        let mut event: vr::VREvent_t = unsafe { std::mem::zeroed() };
+        self.input
+            .get_next_event(std::mem::size_of_val(&event) as u32, &mut event)
+            .then_some(event)
+    }
+
+    /// A hand's controller: its device index and whether it's connected.
+    pub fn controller_slot(&self, hand: Hand) -> Option<(usize, bool)> {
+        let data = self.input.openxr.session_data.get();
+        let devices = data.input_data.devices.read().unwrap();
+        devices
+            .iter()
+            .position(|d| d.get_controller_hand() == Some(hand))
+            .map(|i| (i, devices.get_device(i as u32).unwrap().connected))
+    }
+}
+
+#[test]
+fn devices_survive_session_restart() {
+    let mut f = Fixture::new();
+    let active = vr::VRActiveActionSet_t {
+        ulActionSet: f.get_action_set_handle(c"/actions/set1"),
+        ..Default::default()
+    };
+    f.load_actions(c"actions.json");
+    f.input.openxr.restart_session(); // into the real session
+    f.set_interaction_profile::<Knuckles>(LeftHand);
+    f.sync(active);
+    while let Some(event) = f.next_event() {
+        assert_eq!(
+            event.eventType,
+            vr::EVREventType::TrackedDeviceActivated as u32
+        );
+    }
+    let before = f.controller_slot(Hand::Left).expect("the left controller");
+
+    f.input.openxr.restart_session();
+    // Right after the restart, and once the runtime reports it again: same
+    // index, still connected, and nothing for the game to react to.
+    assert_eq!(f.controller_slot(Hand::Left), Some(before));
+    f.set_interaction_profile::<Knuckles>(LeftHand);
+    f.sync(active);
+    assert_eq!(f.controller_slot(Hand::Left), Some(before));
+    assert!(f.next_event().is_none(), "no disconnect / reconnect");
+}

@@ -48,6 +48,7 @@ impl std::fmt::Debug for TrackedDeviceType {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct ProfileData {
     properties: &'static ProfileProperties,
     get_hand_offset: fn(Hand) -> Mat4,
@@ -350,6 +351,39 @@ pub struct TrackedDeviceList {
     devices: Vec<TrackedDevice>,
 }
 
+/// A device list's slots and states without what belonged to the session they
+/// were made in (hand trackers, tracker spaces): what a session restart carries
+/// over, so devices keep their indices and the game sees no disconnect.
+pub struct DeviceLayout(Vec<DeviceSlot>);
+
+struct DeviceSlot {
+    /// None for the headset.
+    hand: Option<Hand>,
+    profile_data: Option<ProfileData>,
+    profile_path: xr::Path,
+    connected: bool,
+    previous_connected: bool,
+}
+
+/// A hand tracker for `hand`, where the runtime has hand tracking.
+pub(super) fn create_hand_tracker(
+    session: &xr::Session<xr::AnyGraphics>,
+    hand: Hand,
+) -> Option<xr::HandTracker> {
+    session
+        .create_hand_tracker(hand.into())
+        .inspect_err(|e| {
+            if !matches!(
+                *e,
+                xr::sys::Result::ERROR_EXTENSION_NOT_PRESENT
+                    | xr::sys::Result::ERROR_FEATURE_UNSUPPORTED
+            ) {
+                log::warn!("Failed to create hand tracker for hand {hand:?}: {e}");
+            }
+        })
+        .ok()
+}
+
 impl Default for TrackedDeviceList {
     fn default() -> Self {
         Self {
@@ -359,6 +393,60 @@ impl Default for TrackedDeviceList {
 }
 
 impl TrackedDeviceList {
+    /// Generic trackers are left out: they come back from the runtime's own list.
+    pub(super) fn layout(&self) -> DeviceLayout {
+        DeviceLayout(
+            self.devices
+                .iter()
+                .filter_map(|d| {
+                    let hand = match d.device_type {
+                        TrackedDeviceType::Hmd => None,
+                        TrackedDeviceType::Controller { hand, .. } => Some(hand),
+                        #[cfg(feature = "monado")]
+                        TrackedDeviceType::GenericTracker { .. } => return None,
+                    };
+                    Some(DeviceSlot {
+                        hand,
+                        profile_data: d.profile_data,
+                        profile_path: d.profile_path,
+                        connected: d.connected,
+                        previous_connected: d.previous_connected,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// The devices of `layout`, made again for a new session.
+    pub(super) fn from_layout(
+        layout: DeviceLayout,
+        session: &xr::Session<xr::AnyGraphics>,
+    ) -> Self {
+        if layout.0.is_empty() {
+            return Self::default();
+        }
+        let devices = layout
+            .0
+            .into_iter()
+            .map(|slot| {
+                let device_type = match slot.hand {
+                    None => TrackedDeviceType::Hmd,
+                    Some(hand) => TrackedDeviceType::Controller {
+                        hand,
+                        hand_tracker: create_hand_tracker(session, hand),
+                        skeleton_cache: Mutex::new(Default::default()),
+                    },
+                };
+                let mut device =
+                    TrackedDevice::new(device_type, Some(slot.profile_path), slot.profile_data);
+                device.connected = slot.connected;
+                device.previous_connected = slot.previous_connected;
+                device
+            })
+            .collect();
+        Self { devices }
+    }
+
     pub(super) fn get_device(
         &self,
         device_index: vr::TrackedDeviceIndex_t,
