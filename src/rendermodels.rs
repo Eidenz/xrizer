@@ -599,10 +599,8 @@ impl OwnedRenderModel {
 
         let mut normals = vec![Vec3::ZERO; verts.len()];
 
-        for tri in indices.chunks_exact(3) {
-            let ia = tri[0] as usize;
-            let ib = tri[1] as usize;
-            let ic = tri[2] as usize;
+        for &[ia, ib, ic] in indices.as_chunks::<3>().0 {
+            let (ia, ib, ic) = (ia as usize, ib as usize, ic as usize);
 
             let a = Vec3::from_array(verts[ia].vPosition.v);
             let b = Vec3::from_array(verts[ib].vPosition.v);
