@@ -126,6 +126,12 @@ pub fn set_grip(session: xr::Session, path: UserPath, pose: xr::Posef) {
     get_hand_data(path, &session).grip_pose.store(pose);
 }
 
+/// What xrGetReferenceSpaceBoundsRect reports for STAGE (None: unavailable).
+pub fn set_stage_bounds(session: xr::Session, bounds: Option<xr::Extent2Df>) {
+    let session = session.to_handle().unwrap();
+    session.stage_bounds.store(bounds);
+}
+
 pub fn set_aim(session: xr::Session, path: UserPath, pose: xr::Posef) {
     let session = session.to_handle().unwrap();
     get_hand_data(path, &session).aim_pose.store(pose);
@@ -315,7 +321,7 @@ pub unsafe extern "system" fn get_instance_proc_addr(
                     (PollEvent),
                     StringToPath,
                     PathToString,
-                    (GetReferenceSpaceBoundsRect),
+                    GetReferenceSpaceBoundsRect,
                     GetActionStateBoolean,
                     GetActionStateFloat,
                     GetActionStateVector2f,
@@ -542,6 +548,7 @@ struct Session {
     should_render: AtomicBool,
     frame_state: AtomicCell<FrameState>,
     with_trackers: AtomicBool,
+    stage_bounds: AtomicCell<Option<xr::Extent2Df>>,
 }
 
 impl Session {
@@ -886,6 +893,7 @@ extern "system" fn create_session(
         should_render: false.into(),
         frame_state: FrameState::Ended.into(),
         with_trackers: false.into(),
+        stage_bounds: None.into(),
     });
 
     let tx = sess.event_sender.clone();
@@ -1524,6 +1532,28 @@ extern "system" fn get_current_interaction_profile(
     }
 
     xr::Result::SUCCESS
+}
+
+extern "system" fn get_reference_space_bounds_rect(
+    session: xr::Session,
+    ty: xr::ReferenceSpaceType,
+    bounds: *mut xr::Extent2Df,
+) -> xr::Result {
+    let session = get_handle!(session);
+    let known = (ty == xr::ReferenceSpaceType::STAGE)
+        .then(|| session.stage_bounds.load())
+        .flatten();
+    unsafe {
+        *bounds = known.unwrap_or(xr::Extent2Df {
+            width: 0.0,
+            height: 0.0,
+        });
+    }
+    if known.is_some() {
+        xr::Result::SUCCESS
+    } else {
+        xr::Result::SPACE_BOUNDS_UNAVAILABLE
+    }
 }
 
 extern "system" fn locate_space(
