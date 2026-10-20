@@ -1,7 +1,7 @@
 pub mod vulkan;
 
 mod monado_xdev;
-pub use monado_xdev::add_trackers;
+pub use monado_xdev::{add_trackers, set_tracker_location_flags, set_tracker_serials};
 
 use crossbeam_utils::atomic::AtomicCell;
 use glam::{Affine3A, Quat, Vec3};
@@ -478,6 +478,8 @@ struct EventDataBuffer {
 }
 
 struct Instance {
+    tracker_serials: Mutex<Vec<String>>,
+    tracker_location_flags: Mutex<HashMap<String, xr::SpaceLocationFlags>>,
     event_receiver: Mutex<mpsc::Receiver<EventDataBuffer>>,
     event_sender: mpsc::Sender<EventDataBuffer>,
     paths: Mutex<SlotMap<DefaultKey, String>>,
@@ -547,7 +549,6 @@ struct Session {
     state_synced: AtomicBool,
     should_render: AtomicBool,
     frame_state: AtomicCell<FrameState>,
-    with_trackers: AtomicBool,
     stage_bounds: AtomicCell<Option<xr::Extent2Df>>,
 }
 
@@ -653,6 +654,7 @@ enum SpaceType {
         action: Weak<Action>,
     },
     Reference(xr::ReferenceSpaceType),
+    Tracker(String),
 }
 
 struct Space {
@@ -684,7 +686,17 @@ impl Space {
             return Ok(xr::SpaceLocation {
                 ty: xr::SpaceLocation::TYPE,
                 next: std::ptr::null_mut(),
-                location_flags: *LOCATION_FLAGS_TRACKED,
+                location_flags: if let SpaceType::Tracker(serial) = &self.ty {
+                    let instance = session.instance.upgrade().unwrap();
+                    *instance
+                        .tracker_location_flags
+                        .lock()
+                        .unwrap()
+                        .get(serial)
+                        .unwrap_or(&LOCATION_FLAGS_TRACKED)
+                } else {
+                    *LOCATION_FLAGS_TRACKED
+                },
                 pose: ret,
             });
         };
@@ -849,6 +861,8 @@ extern "system" fn create_instance(
         right
     });
     let inst = Arc::new(Instance {
+        tracker_serials: Mutex::new(Vec::new()),
+        tracker_location_flags: Mutex::new(HashMap::new()),
         event_receiver: rx.into(),
         event_sender: tx,
         paths: Mutex::new(paths),
@@ -892,7 +906,6 @@ extern "system" fn create_session(
         state_synced: true.into(),
         should_render: false.into(),
         frame_state: FrameState::Ended.into(),
-        with_trackers: false.into(),
         stage_bounds: None.into(),
     });
 

@@ -1454,12 +1454,20 @@ impl<C: openxr_data::Compositor> Input<C> {
         #[cfg(feature = "monado")]
         devices
             .create_monado_generic_trackers(&self.openxr, session_data)
-            .unwrap();
+            .unwrap_or_else(|e| warn!("Couldn't refresh generic trackers: {e}"));
     }
 
     pub fn frame_start_update(&self) {
         tracy_span!();
         let data = self.openxr.session_data.get();
+        #[cfg(feature = "monado")]
+        {
+            let mut devices = data.input_data.devices.write().unwrap();
+            devices.refresh_monado_generic_trackers(&self.openxr, &data);
+            for device in devices.iter_mut() {
+                device.update_tracker_connection(&self.openxr, &data);
+            }
+        }
         let devices = data.input_data.devices.read().unwrap();
 
         for device in devices.iter() {

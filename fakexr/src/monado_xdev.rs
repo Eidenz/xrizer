@@ -5,7 +5,6 @@ use openxr_mndx_xdev_space::bindings::XDevIdMNDX;
 use openxr_sys as xr;
 use std::ffi::{CString, c_char};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 #[derive(Default)]
 pub(super) struct XDevListMNDX {
@@ -23,8 +22,30 @@ pub(super) struct XDev {
 impl_handle!(XDevListMNDX, openxr_mndx_xdev_space::bindings::XDevListMNDX);
 
 pub fn add_trackers(session: xr::Session) {
+    set_tracker_serials(session, &["FAKEXR-SERIAL"]);
+}
+
+/// Change the runtime's device list without sending a hand profile event.
+pub fn set_tracker_serials(session: xr::Session, serials: &[&str]) {
     let session = session.to_handle().unwrap();
-    session.with_trackers.store(true, Ordering::Relaxed);
+    let instance = session.instance.upgrade().unwrap();
+    *instance.tracker_serials.lock().unwrap() = serials.iter().map(|s| s.to_string()).collect();
+}
+
+/// Model a tracker losing tracking or becoming unavailable without disappearing
+/// from the runtime's XDev list (as append-only hotplug implementations behave).
+pub fn set_tracker_location_flags(
+    session: xr::Session,
+    serial: &str,
+    flags: xr::SpaceLocationFlags,
+) {
+    let session = session.to_handle().unwrap();
+    let instance = session.instance.upgrade().unwrap();
+    instance
+        .tracker_location_flags
+        .lock()
+        .unwrap()
+        .insert(serial.to_string(), flags);
 }
 
 pub(super) extern "system" fn create_x_dev_list_m_n_d_x(
@@ -33,18 +54,21 @@ pub(super) extern "system" fn create_x_dev_list_m_n_d_x(
     xdev_list: *mut openxr_mndx_xdev_space::bindings::XDevListMNDX,
 ) -> xr::Result {
     let session = get_handle!(session);
-    let xdevs = if session.with_trackers.load(Ordering::Relaxed) {
-        vec![XDev {
-            // monado starts counting xdevs at 43
-            // https://gitlab.freedesktop.org/monado/monado/-/blob/main/src/xrt/state_trackers/oxr/oxr_xdev.c#L170
-            id: XDevIdMNDX::from_raw(43u64),
+    let instance = session.instance.upgrade().unwrap();
+    let xdevs = instance
+        .tracker_serials
+        .lock()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(i, serial)| XDev {
+            // Like Monado, each list is a snapshot, with IDs starting at 43.
+            id: XDevIdMNDX::from_raw(43 + i as u64),
             can_create_space: true,
             name: c"FAKEXR-TRACKER".to_owned(),
-            serial: c"FAKEXR-SERIAL".to_owned(),
-        }]
-    } else {
-        vec![]
-    };
+            serial: CString::new(serial.as_str()).unwrap(),
+        })
+        .collect();
     let list = Arc::new(XDevListMNDX {
         generation_number: 1, // monado always sets this at 1
         xdevs,
@@ -152,15 +176,22 @@ pub(super) extern "system" fn create_x_dev_space_m_n_d_x(
     space: *mut xr::Space,
 ) -> xr::Result {
     let s = get_handle!(session);
+    let instance = s.instance.upgrade().unwrap();
     unsafe {
-        if (*create_info).xdev_id != XDevIdMNDX::from_raw(43u64) {
+        if (*create_info).xdev_id.into_raw() < 43
+            || (*create_info).xdev_id.into_raw()
+                >= 43 + instance.tracker_serials.lock().unwrap().len() as u64
+        {
             return xr::Result::ERROR_INDEX_OUT_OF_RANGE;
         }
     }
 
     let create_info = unsafe { create_info.as_ref().unwrap() };
+    let serial = instance.tracker_serials.lock().unwrap()
+        [(create_info.xdev_id.into_raw() - 43) as usize]
+        .clone();
     let xdev_space = Arc::new(Space {
-        ty: SpaceType::Reference(xr::ReferenceSpaceType::VIEW),
+        ty: SpaceType::Tracker(serial),
         offset: create_info.offset,
         session: Arc::downgrade(&s),
     });

@@ -2,6 +2,8 @@ use std::any::TypeId;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::Mutex;
+#[cfg(feature = "monado")]
+use std::time::{Duration, Instant};
 
 use glam::Mat4;
 use openvr as vr;
@@ -30,7 +32,7 @@ pub enum TrackedDeviceType {
     },
     #[cfg(feature = "monado")]
     GenericTracker {
-        space: xr::Space,
+        space: Option<xr::Space>,
         serial: CString,
     },
 }
@@ -144,13 +146,20 @@ fn get_generic_tracker_pose(
     };
 
     let (location, velocity) = space
+        .as_ref()?
         .relate(
             session_data.get_space_for_origin(origin),
             xr_data.display_time.get(),
         )
         .ok()?;
 
-    Some(vr::space_relation_to_openvr_pose(location, velocity))
+    let mut pose = vr::space_relation_to_openvr_pose(location, velocity);
+    if !location.location_flags.contains(
+        xr::SpaceLocationFlags::POSITION_TRACKED | xr::SpaceLocationFlags::ORIENTATION_TRACKED,
+    ) {
+        pose.eTrackingResult = vr::ETrackingResult::Running_OutOfRange;
+    }
+    Some(pose)
 }
 
 impl TrackedDevice {
@@ -192,6 +201,29 @@ impl TrackedDevice {
         };
 
         *pose_cache
+    }
+
+    #[cfg(feature = "monado")]
+    pub(super) fn update_tracker_connection(
+        &mut self,
+        xr_data: &OpenXrData<impl crate::openxr_data::Compositor>,
+        session_data: &SessionData,
+    ) {
+        if !matches!(self.device_type, TrackedDeviceType::GenericTracker { .. }) {
+            return;
+        }
+        // OpenXR exposes pose validity, not a tracker's physical power state.
+        // Use LOCAL so stage calibration cannot make a connected tracker disappear.
+        // Valid but untracked (held/inferred) poses remain connected. If the runtime
+        // also invalidates the pose on power-off, mirror that in OpenVR's device
+        // state and activation/deactivation events, keeping the slot for its return.
+        self.connected = get_generic_tracker_pose(
+            xr_data,
+            session_data,
+            self,
+            vr::ETrackingUniverseOrigin::Seated,
+        )
+        .is_some_and(|pose| pose.bDeviceIsConnected);
     }
 
     pub fn get_hand_skeleton(
@@ -349,6 +381,8 @@ impl SubactionPaths {
 
 pub struct TrackedDeviceList {
     devices: Vec<TrackedDevice>,
+    #[cfg(feature = "monado")]
+    last_tracker_refresh: Option<Instant>,
 }
 
 /// A device list's slots and states without what belonged to the session they
@@ -357,12 +391,18 @@ pub struct TrackedDeviceList {
 pub struct DeviceLayout(Vec<DeviceSlot>);
 
 struct DeviceSlot {
-    /// None for the headset.
-    hand: Option<Hand>,
+    device_type: DeviceSlotType,
     profile_data: Option<ProfileData>,
     profile_path: xr::Path,
     connected: bool,
     previous_connected: bool,
+}
+
+enum DeviceSlotType {
+    Hmd,
+    Controller(Hand),
+    #[cfg(feature = "monado")]
+    GenericTracker(CString),
 }
 
 /// A hand tracker for `hand`, where the runtime has hand tracking.
@@ -388,30 +428,36 @@ impl Default for TrackedDeviceList {
     fn default() -> Self {
         Self {
             devices: vec![TrackedDevice::new(TrackedDeviceType::Hmd, None, None)],
+            #[cfg(feature = "monado")]
+            last_tracker_refresh: None,
         }
     }
 }
 
 impl TrackedDeviceList {
-    /// Generic trackers are left out: they come back from the runtime's own list.
+    /// Preserve every slot, including trackers discovered before controllers.
     pub(super) fn layout(&self) -> DeviceLayout {
         DeviceLayout(
             self.devices
                 .iter()
-                .filter_map(|d| {
-                    let hand = match d.device_type {
-                        TrackedDeviceType::Hmd => None,
-                        TrackedDeviceType::Controller { hand, .. } => Some(hand),
+                .map(|d| {
+                    let device_type = match &d.device_type {
+                        TrackedDeviceType::Hmd => DeviceSlotType::Hmd,
+                        TrackedDeviceType::Controller { hand, .. } => {
+                            DeviceSlotType::Controller(*hand)
+                        }
                         #[cfg(feature = "monado")]
-                        TrackedDeviceType::GenericTracker { .. } => return None,
+                        TrackedDeviceType::GenericTracker { serial, .. } => {
+                            DeviceSlotType::GenericTracker(serial.clone())
+                        }
                     };
-                    Some(DeviceSlot {
-                        hand,
+                    DeviceSlot {
+                        device_type,
                         profile_data: d.profile_data,
                         profile_path: d.profile_path,
                         connected: d.connected,
                         previous_connected: d.previous_connected,
-                    })
+                    }
                 })
                 .collect(),
         )
@@ -429,12 +475,17 @@ impl TrackedDeviceList {
             .0
             .into_iter()
             .map(|slot| {
-                let device_type = match slot.hand {
-                    None => TrackedDeviceType::Hmd,
-                    Some(hand) => TrackedDeviceType::Controller {
+                let device_type = match slot.device_type {
+                    DeviceSlotType::Hmd => TrackedDeviceType::Hmd,
+                    DeviceSlotType::Controller(hand) => TrackedDeviceType::Controller {
                         hand,
                         hand_tracker: create_hand_tracker(session, hand),
                         skeleton_cache: Mutex::new(Default::default()),
+                    },
+                    #[cfg(feature = "monado")]
+                    DeviceSlotType::GenericTracker(serial) => TrackedDeviceType::GenericTracker {
+                        serial,
+                        space: None,
                     },
                 };
                 let mut device =
@@ -444,7 +495,11 @@ impl TrackedDeviceList {
                 device
             })
             .collect();
-        Self { devices }
+        Self {
+            devices,
+            #[cfg(feature = "monado")]
+            last_tracker_refresh: None,
+        }
     }
 
     pub(super) fn get_device(
@@ -495,6 +550,7 @@ impl TrackedDeviceList {
         xr_data: &OpenXrData<impl crate::openxr_data::Compositor>,
         session_data: &SessionData,
     ) -> xr::Result<()> {
+        self.last_tracker_refresh = Some(Instant::now());
         if !xr_data
             .enabled_extensions
             .other
@@ -503,17 +559,12 @@ impl TrackedDeviceList {
             return Ok(());
         }
 
-        self.devices.retain(|device| {
-            !matches!(device.device_type, TrackedDeviceType::GenericTracker { .. })
-        });
-
-        let max_generic_trackers = vr::k_unMaxTrackedDeviceCount as usize - self.devices.len();
         let extra_tracker_serials = std::env::var("XRIZER_TRACKER_SERIALS")
             .map_or(vec![], |trackers| {
                 trackers.split(";").map(|t| t.to_string()).collect()
             });
 
-        let mut xdevs: Vec<XDev> = session_data
+        let xdevs: Vec<XDev> = session_data
             .session
             .get_xdev_list()?
             .enumerate_xdevs()?
@@ -525,27 +576,88 @@ impl TrackedDeviceList {
             })
             .collect();
 
-        xdevs.truncate(max_generic_trackers);
+        // Keep slots stable when the runtime stops listing a device. A returning
+        // serial reuses its old slot, even if other devices have since arrived.
+        for device in &mut self.devices {
+            let TrackedDeviceType::GenericTracker { serial, space } = &mut device.device_type
+            else {
+                continue;
+            };
+            if !xdevs
+                .iter()
+                .any(|xdev| xdev.serial().as_bytes() == serial.as_bytes())
+            {
+                *space = None;
+                device.connected = false;
+            }
+        }
 
-        log::info!(
-            "Creating {} generic trackers via Monado XDev extension",
-            xdevs.len()
-        );
-
-        let trackers = xdevs.into_iter().map(|xdev| {
+        for xdev in xdevs {
+            let existing = self.devices.iter().position(|device| {
+                matches!(&device.device_type, TrackedDeviceType::GenericTracker { serial, .. }
+                    if xdev.serial().as_bytes() == serial.as_bytes())
+            });
+            if let Some(index) = existing {
+                let device = &mut self.devices[index];
+                let TrackedDeviceType::GenericTracker { space, .. } = &mut device.device_type
+                else {
+                    unreachable!();
+                };
+                if space.is_none() {
+                    match xdev.create_space(xr::Posef::IDENTITY) {
+                        Ok(new_space) => {
+                            *space = Some(new_space);
+                        }
+                        Err(e) => log::warn!("Couldn't recreate tracker {}: {e}", xdev.serial()),
+                    }
+                }
+                continue;
+            }
+            if self.devices.len() >= vr::k_unMaxTrackedDeviceCount as usize {
+                continue;
+            }
+            let space = match xdev.create_space(xr::Posef::IDENTITY) {
+                Ok(space) => space,
+                Err(e) => {
+                    log::warn!("Couldn't create tracker {}: {e}", xdev.serial());
+                    continue;
+                }
+            };
             let serial = CString::new(xdev.serial()).unwrap();
-            let space = xdev.create_space(xr::Posef::IDENTITY).unwrap();
-            let mut tracker = TrackedDevice::new(
-                TrackedDeviceType::GenericTracker { serial, space },
+            log::info!(
+                "Adding generic tracker {} at device index {} via Monado XDev extension",
+                xdev.serial(),
+                self.devices.len()
+            );
+            let tracker = TrackedDevice::new(
+                TrackedDeviceType::GenericTracker {
+                    serial,
+                    space: Some(space),
+                },
                 None,
                 Some(ProfileData::new::<ViveTracker>()),
             );
-            tracker.connected = true;
-            tracker
-        });
-        self.devices.extend(trackers);
+            self.devices.push(tracker);
+        }
 
         Ok(())
+    }
+
+    #[cfg(feature = "monado")]
+    pub(super) fn refresh_monado_generic_trackers(
+        &mut self,
+        xr_data: &OpenXrData<impl crate::openxr_data::Compositor>,
+        session_data: &SessionData,
+    ) {
+        // Tracker hotplug need not change either hand's interaction profile.
+        // XDev lists are snapshots, so periodically request a fresh one.
+        if self
+            .last_tracker_refresh
+            .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+        {
+            self.create_monado_generic_trackers(xr_data, session_data)
+                .unwrap_or_else(|e| log::warn!("Couldn't refresh generic trackers: {e}"));
+        }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &TrackedDevice> {
@@ -691,65 +803,279 @@ impl<C: openxr_data::Compositor> Input<C> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "monado"))]
 mod tests {
     use crate::input::{profiles::knuckles::Knuckles, tests::Fixture};
+    use crate::openxr_data::Hand;
     use openvr as vr;
+    use std::time::{Duration, Instant};
 
-    #[test]
-    #[cfg_attr(not(feature = "monado"), ignore)]
-    fn get_tracker_pose() {
-        let mut f = Fixture::new();
+    fn fixture() -> Fixture {
+        let f = Fixture::new();
         f.load_actions(c"actions.json");
-        f.set_interaction_profile::<Knuckles>(fakexr::UserPath::LeftHand);
-        fakexr::add_trackers(f.input.openxr.session_data.get().session.as_raw());
+        f.input.openxr.restart_session(); // use the real session before adding devices
+        f
+    }
 
-        let frame = || {
-            f.input.openxr.poll_events();
-            f.input.frame_start_update();
-        };
+    fn frame(f: &Fixture) {
+        f.input.openxr.poll_events();
+        f.input.frame_start_update();
+    }
 
-        // we need to wait two frames for the tracker to be connected.
-        frame();
-        assert!(f.input.device_index_to_tracked_device_class(2).is_none());
-        frame();
-        assert!(
-            f.input.device_index_to_tracked_device_class(2)
-                == Some(vr::ETrackedDeviceClass::GenericTracker)
-        );
+    fn refresh(f: &Fixture) {
+        // Advance the refresh deadline without sleeping in tests.
+        f.input
+            .openxr
+            .session_data
+            .get()
+            .input_data
+            .devices
+            .write()
+            .unwrap()
+            .last_tracker_refresh = Some(Instant::now() - Duration::from_secs(2));
+        frame(f);
+    }
 
-        let pose2 = f
-            .input
-            .get_device_pose(2, Some(vr::ETrackingUniverseOrigin::Seated));
-        assert!(pose2.is_some());
+    fn serial(f: &Fixture, index: u32) -> String {
+        f.input
+            .get_device_string_tracked_property(
+                index,
+                vr::ETrackedDeviceProperty::SerialNumber_String,
+            )
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn events(f: &Fixture) -> Vec<(u32, u32)> {
+        std::iter::from_fn(|| f.next_event())
+            .map(|e| (e.eventType, e.trackedDeviceIndex))
+            .collect()
     }
 
     #[test]
-    #[cfg_attr(not(feature = "monado"), ignore)]
-    fn get_tracker_serial() {
-        let mut f = Fixture::new();
-        f.load_actions(c"actions.json");
+    fn get_tracker_pose() {
+        let mut f = fixture();
         f.set_interaction_profile::<Knuckles>(fakexr::UserPath::LeftHand);
-        fakexr::add_trackers(f.input.openxr.session_data.get().session.as_raw());
+        frame(&f);
+        frame(&f);
+        fakexr::add_trackers(f.raw_session());
+        refresh(&f);
+        assert_eq!(
+            f.input.device_index_to_tracked_device_class(2),
+            Some(vr::ETrackedDeviceClass::GenericTracker)
+        );
+        let pose = f
+            .input
+            .get_device_pose(2, Some(vr::ETrackingUniverseOrigin::Seated))
+            .unwrap();
+        assert!(pose.bPoseIsValid);
+    }
 
-        let frame = || {
-            f.input.openxr.poll_events();
-            f.input.frame_start_update();
-        };
+    #[test]
+    fn get_tracker_serial() {
+        let f = fixture();
+        fakexr::add_trackers(f.raw_session());
+        refresh(&f);
+        assert_eq!(serial(&f, 1), "FAKEXR-SERIAL");
+    }
 
-        // we need to wait two frames for the tracker to be connected.
-        frame();
-        assert!(f.input.device_index_to_tracked_device_class(2).is_none());
-        frame();
+    #[test]
+    fn tracker_hotplug_without_profile_events_is_throttled() {
+        let f = fixture();
+        frame(&f); // initially no trackers or controllers
+        events(&f);
+        fakexr::add_trackers(f.raw_session());
+        frame(&f);
+        assert_eq!(f.input.device_index_to_tracked_device_class(1), None);
+
+        refresh(&f);
+        assert_eq!(serial(&f, 1), "FAKEXR-SERIAL");
+        assert_eq!(
+            events(&f),
+            vec![(vr::EVREventType::TrackedDeviceActivated as u32, 1)]
+        );
+        refresh(&f);
         assert!(
-            f.input.device_index_to_tracked_device_class(2)
-                == Some(vr::ETrackedDeviceClass::GenericTracker)
+            events(&f).is_empty(),
+            "known trackers must not be reactivated"
+        );
+        assert_eq!(f.input.device_index_to_tracked_device_class(2), None);
+    }
+
+    #[test]
+    fn tracker_slots_survive_reordering_removal_and_reappearance() {
+        let f = fixture();
+        fakexr::set_tracker_serials(f.raw_session(), &["first"]);
+        refresh(&f);
+        events(&f);
+        fakexr::set_tracker_serials(f.raw_session(), &["second", "first"]);
+        refresh(&f);
+        assert_eq!(serial(&f, 1), "first");
+        assert_eq!(serial(&f, 2), "second");
+        assert_eq!(
+            events(&f),
+            vec![(vr::EVREventType::TrackedDeviceActivated as u32, 2)]
         );
 
-        let serial = f
+        fakexr::set_tracker_serials(f.raw_session(), &["second"]);
+        refresh(&f);
+        assert!(!f.input.is_device_connected(1));
+        assert_eq!(
+            events(&f),
+            vec![(vr::EVREventType::TrackedDeviceDeactivated as u32, 1)]
+        );
+        fakexr::set_tracker_serials(f.raw_session(), &["second", "first"]);
+        refresh(&f);
+        assert_eq!(serial(&f, 1), "first");
+        assert_eq!(serial(&f, 2), "second");
+        assert_eq!(
+            events(&f),
+            vec![(vr::EVREventType::TrackedDeviceActivated as u32, 1)]
+        );
+    }
+
+    #[test]
+    fn trackers_before_controllers_keep_slots_across_session_restart() {
+        let mut f = fixture();
+        fakexr::set_tracker_serials(f.raw_session(), &["first"]);
+        refresh(&f);
+        f.set_interaction_profile::<Knuckles>(fakexr::UserPath::LeftHand);
+        frame(&f);
+        frame(&f);
+        assert_eq!(f.controller_slot(Hand::Left), Some((2, true)));
+        fakexr::set_tracker_serials(f.raw_session(), &["second", "first"]);
+        refresh(&f);
+        events(&f);
+
+        f.input.openxr.restart_session();
+        assert_eq!(serial(&f, 1), "first");
+        assert_eq!(f.controller_slot(Hand::Left), Some((2, true)));
+        assert_eq!(serial(&f, 3), "second");
+        assert!(events(&f).is_empty(), "no reconnect for surviving devices");
+        assert!(
+            f.input
+                .get_device_pose(1, Some(vr::ETrackingUniverseOrigin::Seated))
+                .unwrap()
+                .bPoseIsValid
+        );
+        assert!(
+            f.input
+                .get_device_pose(3, Some(vr::ETrackingUniverseOrigin::Seated))
+                .unwrap()
+                .bPoseIsValid
+        );
+    }
+
+    #[test]
+    fn unavailable_tracker_is_deactivated_and_returns_in_the_same_slot() {
+        use openxr::SpaceLocationFlags as Flags;
+        let f = fixture();
+        fakexr::add_trackers(f.raw_session());
+        refresh(&f);
+        events(&f);
+
+        // The runtime keeps the device listed after power-off but invalidates its pose.
+        fakexr::set_tracker_location_flags(f.raw_session(), "FAKEXR-SERIAL", Flags::EMPTY);
+        frame(&f);
+        assert!(!f.input.is_device_connected(1));
+        let pose = f
             .input
-            .get_device_string_tracked_property(2, vr::ETrackedDeviceProperty::SerialNumber_String)
+            .get_device_pose(1, Some(vr::ETrackingUniverseOrigin::Seated))
             .unwrap();
-        assert_eq!(serial.to_str().unwrap(), "FAKEXR-SERIAL");
+        assert!(!pose.bDeviceIsConnected);
+        assert!(!pose.bPoseIsValid);
+        assert_eq!(
+            events(&f),
+            vec![(vr::EVREventType::TrackedDeviceDeactivated as u32, 1)]
+        );
+        frame(&f);
+        refresh(&f); // enumeration must not reconnect a listed but unavailable device
+        assert!(!f.input.is_device_connected(1));
+        assert!(events(&f).is_empty());
+
+        fakexr::set_tracker_location_flags(
+            f.raw_session(),
+            "FAKEXR-SERIAL",
+            Flags::POSITION_VALID
+                | Flags::ORIENTATION_VALID
+                | Flags::POSITION_TRACKED
+                | Flags::ORIENTATION_TRACKED,
+        );
+        frame(&f);
+        assert!(f.input.is_device_connected(1));
+        assert_eq!(serial(&f, 1), "FAKEXR-SERIAL");
+        assert_eq!(
+            events(&f),
+            vec![(vr::EVREventType::TrackedDeviceActivated as u32, 1)]
+        );
+    }
+
+    #[test]
+    fn held_tracker_pose_remains_connected_but_reports_out_of_range() {
+        use openxr::SpaceLocationFlags as Flags;
+        let f = fixture();
+        fakexr::add_trackers(f.raw_session());
+        refresh(&f);
+        events(&f);
+        fakexr::set_tracker_location_flags(
+            f.raw_session(),
+            "FAKEXR-SERIAL",
+            Flags::POSITION_VALID | Flags::ORIENTATION_VALID,
+        );
+        frame(&f);
+        assert!(f.input.is_device_connected(1));
+        let pose = f
+            .input
+            .get_device_pose(1, Some(vr::ETrackingUniverseOrigin::Seated))
+            .unwrap();
+        assert!(pose.bDeviceIsConnected);
+        assert!(pose.bPoseIsValid);
+        assert_eq!(
+            pose.eTrackingResult,
+            vr::ETrackingResult::Running_OutOfRange
+        );
+        assert!(events(&f).is_empty());
+    }
+
+    #[test]
+    fn initially_unavailable_tracker_is_not_announced_as_connected() {
+        let f = fixture();
+        events(&f);
+        fakexr::add_trackers(f.raw_session());
+        fakexr::set_tracker_location_flags(
+            f.raw_session(),
+            "FAKEXR-SERIAL",
+            openxr::SpaceLocationFlags::EMPTY,
+        );
+        refresh(&f);
+        assert!(!f.input.is_device_connected(1));
+        assert!(events(&f).is_empty());
+    }
+
+    #[test]
+    fn tracker_hotplug_respects_openvr_capacity() {
+        let f = fixture();
+        let serials: Vec<String> = (0..vr::k_unMaxTrackedDeviceCount + 2)
+            .map(|i| format!("tracker-{i}"))
+            .collect();
+        let refs: Vec<&str> = serials.iter().map(String::as_str).collect();
+        fakexr::set_tracker_serials(f.raw_session(), &refs);
+        refresh(&f);
+        refresh(&f);
+        assert_eq!(
+            f.input
+                .openxr
+                .session_data
+                .get()
+                .input_data
+                .devices
+                .read()
+                .unwrap()
+                .iter()
+                .count(),
+            vr::k_unMaxTrackedDeviceCount as usize
+        );
     }
 }
